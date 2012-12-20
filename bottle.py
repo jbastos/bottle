@@ -13,7 +13,7 @@ Copyright (c) 2012, Marcel Hellkamp.
 License: MIT (see LICENSE for details)
 """
 
-from __future__ import with_statement
+#from __future__ import with_statement
 
 __author__ = 'Marcel Hellkamp'
 __version__ = '0.12-dev'
