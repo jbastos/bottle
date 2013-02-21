@@ -4,7 +4,7 @@
 import unittest
 import sys, os.path
 import bottle
-from bottle import request, response, tob, touni, tonat, json_dumps, _e
+from bottle import request, response, tob, touni, tonat, json_dumps, _e, HTTPError
 import tools
 import wsgiref.util
 import threading
@@ -14,12 +14,24 @@ from bottle import BaseRequest, BaseResponse, LocalRequest
 
 class TestRequest(unittest.TestCase):
 
-    def test_app(self):
+    def test_app_property(self):
         e = {}
         r = BaseRequest(e)
         self.assertRaises(RuntimeError, lambda: r.app)
         e.update({'bottle.app': 5})
         self.assertEqual(r.app, 5)
+
+    def test_route_property(self):
+        e = {'bottle.route': 5}
+        r = BaseRequest(e)
+        self.assertEqual(r.route, 5)
+
+    def test_url_for_property(self):
+        e = {}
+        r = BaseRequest(e)
+        self.assertRaises(RuntimeError, lambda: r.url_args)
+        e.update({'route.url_args': {'a': 5}})
+        self.assertEqual(r.url_args, {'a': 5})
 
     def test_path(self):
         """ PATH_INFO normalization. """
@@ -328,7 +340,7 @@ class TestRequest(unittest.TestCase):
         e['wsgi.input'].write(tob(json_dumps(test)))
         e['wsgi.input'].seek(0)
         e['CONTENT_LENGTH'] = str(len(json_dumps(test)))
-        self.assertEqual(BaseRequest(e).json, None)
+        self.assertRaises(HTTPError, lambda: BaseRequest(e).json)
 
     def test_json_valid(self):
         """ Environ: Request.json property. """
@@ -389,16 +401,16 @@ class TestRequest(unittest.TestCase):
         e['wsgi.input'].seek(0)
         e['CONTENT_LENGTH'] = '11'
         e['REQUEST_METHOD'] = "POST"
-        e['HTTP_COOKIE'] = 'a=1,b=1,c=1;d=1'
+        e['HTTP_COOKIE'] = 'a=1;b=1;c=1;d=1'
         e['QUERY_STRING'] = 'a&b&c&d'
         old_value = BaseRequest.MAX_PARAMS
         r = BaseRequest(e)
         try:
             BaseRequest.MAX_PARAMS = 2
-            self.assertEqual(len(list(r.query.allitems())), 2)
-            self.assertEqual(len(list(r.cookies.allitems())), 2)
-            self.assertEqual(len(list(r.forms.allitems())), 2)
-            self.assertEqual(len(list(r.params.allitems())), 4)
+            self.assertRaises(HTTPError, lambda: r.query)
+            self.assertRaises(HTTPError, lambda: r.cookies)
+            self.assertRaises(HTTPError, lambda: r.forms)
+            self.assertRaises(HTTPError, lambda: r.params)
         finally:
             BaseRequest.MAX_PARAMS = old_value
 
@@ -417,6 +429,40 @@ class TestRequest(unittest.TestCase):
 
 
 class TestResponse(unittest.TestCase):
+
+    def test_constructor_body(self):
+        self.assertEqual('',
+            BaseResponse('').body)
+
+        self.assertEqual('YAY',
+            BaseResponse('YAY').body)
+
+    def test_constructor_status(self):
+        self.assertEqual(200,
+            BaseResponse('YAY', 200).status_code)
+
+        self.assertEqual('200 OK',
+            BaseResponse('YAY', 200).status_line)
+
+        self.assertEqual('200 YAY',
+            BaseResponse('YAY', '200 YAY').status_line)
+
+        self.assertEqual('200 YAY',
+            BaseResponse('YAY', '200 YAY').status_line)
+
+    def test_constructor_headerlist(self):
+        from functools import partial
+        make_res = partial(BaseResponse, '', 200)
+
+        self.assertTrue('yay',
+            make_res([('x-test','yay')])['x-test'])
+
+    def test_constructor_headerlist(self):
+        from functools import partial
+        make_res = partial(BaseResponse, '', 200)
+
+        self.assertTrue('yay', make_res(x_test='yay')['x-test'])
+
 
     def test_set_status(self):
         rs = BaseResponse()

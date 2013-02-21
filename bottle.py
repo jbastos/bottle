@@ -89,6 +89,7 @@ if py3k:
     json_loads = lambda s: json_lds(touni(s))
     callable = lambda x: hasattr(x, '__call__')
     imap = map
+    def _raise(*a): raise a[0](a[1]).with_traceback(a[2])
 else: # 2.x
     import httplib
     import thread
@@ -107,6 +108,7 @@ else: # 2.x
     else: # 2.6, 2.7
         from collections import MutableMapping as DictMixin
     json_loads = json_lds
+    eval(compile('def _raise(*a): raise a[0], a[1], a[2]', '<py3fix>', 'exec'))
 
 # Some helpers for string/byte handling
 def tob(s, enc='utf8'):
@@ -122,11 +124,6 @@ if py31:
     class NCTextIOWrapper(TextIOWrapper):
         def close(self): pass # Keep wrapped buffer open.
 
-# File uploads (which are implemented as empty FiledStorage instances...)
-# have a negative truth value. That makes no sense, here is a fix.
-class FieldStorage(cgi.FieldStorage):
-    def __nonzero__(self): return bool(self.list or self.file)
-    if py3k: __bool__ = __nonzero__
 
 # A bug in functools causes it to break if the wrapper is an instance method
 def update_wrapper(wrapper, wrapped, *a, **ka):
@@ -178,6 +175,7 @@ class cached_property(object):
         property. '''
 
     def __init__(self, func):
+        self.__doc__ = getattr(func, '__doc__')
         self.func = func
 
     def __get__(self, obj, cls):
@@ -561,14 +559,20 @@ class Bottle(object):
         def mountpoint_wrapper():
             try:
                 request.path_shift(path_depth)
-                rs = BaseResponse([], 200)
-                def start_response(status, header):
+                rs = HTTPResponse([])
+                def start_response(status, headerlist, exc_info=None):
+                    if exc_info:
+                        try:
+                            _raise(*exc_info)
+                        finally:
+                            exc_info = None
                     rs.status = status
-                    for name, value in header: rs.add_header(name, value)
+                    for name, value in headerlist: rs.add_header(name, value)
                     return rs.body.append
                 body = app(request.environ, start_response)
-                body = itertools.chain(rs.body, body)
-                return HTTPResponse(body, rs.status_code, **rs.headers)
+                if body and rs.body: body = itertools.chain(rs.body, body)
+                rs.body = body or rs.body
+                return rs
             finally:
                 request.path_shift(-path_depth)
 
@@ -843,8 +847,7 @@ class Bottle(object):
             msg = 'Unsupported response type: %s' % type(first)
             return self._cast(HTTPError(500, msg))
         if hasattr(out, 'close'):
-            new_iter = _iterchain(new_iter)
-            new_iter.close = out.close
+            new_iter = _closeiter(new_iter, out.close)
         return new_iter
 
     def wsgi(self, environ, start_response):
@@ -870,7 +873,7 @@ class Bottle(object):
                        % (html_escape(repr(_e())), html_escape(format_exc()))
             environ['wsgi.errors'].write(err)
             headers = [('Content-Type', 'text/html; charset=UTF-8')]
-            start_response('500 INTERNAL SERVER ERROR', headers)
+            start_response('500 INTERNAL SERVER ERROR', headers, sys.exc_info())
             return [tob(err)]
 
     def __call__(self, environ, start_response):
@@ -885,7 +888,6 @@ class Bottle(object):
 ###############################################################################
 # HTTP and WSGI Tools ##########################################################
 ###############################################################################
-
 
 class BaseRequest(object):
     """ A wrapper for WSGI environment dictionaries that adds a lot of
@@ -915,6 +917,16 @@ class BaseRequest(object):
         ''' Bottle application handling this request. '''
         raise RuntimeError('This request is not connected to an application.')
 
+    @DictProperty('environ', 'bottle.route', read_only=True)
+    def route(self):
+        """ The bottle :class:`Route` object that matches this request. """
+        raise RuntimeError('This request is not connected to a route.')
+
+    @DictProperty('environ', 'route.url_args', read_only=True)
+    def url_args(self):
+        """ The arguments extracted from the URL. """
+        raise RuntimeError('This request is not connected to a route.')
+
     @property
     def path(self):
         ''' The value of ``PATH_INFO`` with exactly one prefixed slash (to fix
@@ -940,8 +952,9 @@ class BaseRequest(object):
     def cookies(self):
         """ Cookies parsed into a :class:`FormsDict`. Signed cookies are NOT
             decoded. Use :meth:`get_cookie` if you expect signed cookies. """
-        cookies = SimpleCookie(self.environ.get('HTTP_COOKIE',''))
-        cookies = list(cookies.values())[:self.MAX_PARAMS]
+        cookies = SimpleCookie(self.environ.get('HTTP_COOKIE','')).values()
+        if len(cookies) > self.MAX_PARAMS:
+            raise HTTPError(413, 'Too many cookies')
         return FormsDict((c.key, c.value) for c in cookies)
 
     def get_cookie(self, key, default=None, secret=None):
@@ -963,19 +976,21 @@ class BaseRequest(object):
             :class:`Router`. '''
         get = self.environ['bottle.get'] = FormsDict()
         pairs = _parse_qsl(self.environ.get('QUERY_STRING', ''))
-        for key, value in pairs[:self.MAX_PARAMS]:
+        if len(pairs) > self.MAX_PARAMS:
+            raise HTTPError(413, 'Too many parameters')
+        for key, value in pairs:
             get[key] = value
         return get
 
     @DictProperty('environ', 'bottle.request.forms', read_only=True)
     def forms(self):
         """ Form values parsed from an `url-encoded` or `multipart/form-data`
-            encoded POST or PUT request body. The result is retuned as a
+            encoded POST or PUT request body. The result is returned as a
             :class:`FormsDict`. All keys and values are strings. File uploads
             are stored separately in :attr:`files`. """
         forms = FormsDict()
         for name, item in self.POST.allitems():
-            if not hasattr(item, 'filename'):
+            if not isinstance(item, FileUpload):
                 forms[name] = item
         return forms
 
@@ -992,24 +1007,13 @@ class BaseRequest(object):
 
     @DictProperty('environ', 'bottle.request.files', read_only=True)
     def files(self):
-        """ File uploads parsed from an `url-encoded` or `multipart/form-data`
-            encoded POST or PUT request body. The values are instances of
-            :class:`cgi.FieldStorage`. The most important attributes are:
+        """ File uploads parsed from `multipart/form-data` encoded POST or PUT
+            request body. The values are instances of :class:`FileUpload`.
 
-            filename
-                The filename, if specified; otherwise None; this is the client
-                side filename, *not* the file name on which it is stored (that's
-                a temporary file you don't deal with)
-            file
-                The file(-like) object from which you can read the data.
-            value
-                The value as a *string*; for file uploads, this transparently
-                reads the file every time you request the value. Do not do this
-                on big files.
         """
         files = FormsDict()
         for name, item in self.POST.allitems():
-            if hasattr(item, 'filename'):
+            if isinstance(item, FileUpload):
                 files[name] = item
         return files
 
@@ -1019,9 +1023,8 @@ class BaseRequest(object):
             property holds the parsed content of the request body. Only requests
             smaller than :attr:`MEMFILE_MAX` are processed to avoid memory
             exhaustion. '''
-        if 'application/json' in self.environ.get('CONTENT_TYPE', '') \
-        and 0 < self.content_length < self.MEMFILE_MAX:
-            return json_loads(self.body.read(self.MEMFILE_MAX))
+        if 'application/json' in self.environ.get('CONTENT_TYPE', ''):
+            return json_loads(self._get_body_string())
         return None
 
     @DictProperty('environ', 'bottle.request.body', read_only=True)
@@ -1037,6 +1040,18 @@ class BaseRequest(object):
         self.environ['wsgi.input'] = body
         body.seek(0)
         return body
+
+    def _get_body_string(self):
+        ''' read body until content-length or MEMFILE_MAX into a string. Raise
+            HTTPError(413) on requests that are to large. '''
+        clen = self.content_length
+        if clen > self.MEMFILE_MAX:
+            raise HTTPError(413, 'Request to large')
+        if clen < 0: clen = self.MEMFILE_MAX + 1
+        data = self.body.read(clen)
+        if len(data) > self.MEMFILE_MAX: # Fail fast
+            raise HTTPError(413, 'Request to large')
+        return data
 
     @property
     def body(self):
@@ -1061,9 +1076,10 @@ class BaseRequest(object):
         # We default to application/x-www-form-urlencoded for everything that
         # is not multipart and take the fast path (also: 3.1 workaround)
         if not self.content_type.startswith('multipart/'):
-            maxlen = max(0, min(self.content_length, self.MEMFILE_MAX))
-            pairs = _parse_qsl(tonat(self.body.read(maxlen), 'latin1'))
-            for key, value in pairs[:self.MAX_PARAMS]:
+            pairs = _parse_qsl(tonat(self._get_body_string(), 'latin1'))
+            if len(pairs) > self.MAX_PARAMS:
+                raise HTTPError(413, 'Too many parameters')
+            for key, value in pairs:
                 post[key] = value
             return post
 
@@ -1076,9 +1092,16 @@ class BaseRequest(object):
                                          newline='\n')
         elif py3k:
             args['encoding'] = 'ISO-8859-1'
-        data = FieldStorage(**args)
-        for item in (data.list or [])[:self.MAX_PARAMS]:
-            post[item.name] = item if item.filename else item.value
+        data = cgi.FieldStorage(**args)
+        data = data.list or []
+        if len(data) > self.MAX_PARAMS:
+            raise HTTPError(413, 'Too many parameters')
+        for item in data:
+            if item.filename:
+                post[item.name] = FileUpload(item.file, item.name,
+                                             item.filename, item.headers)
+            else:
+                post[item.name] = item.value
         return post
 
     @property
@@ -1275,6 +1298,14 @@ class BaseResponse(object):
         This class does support dict-like case-insensitive item-access to
         headers, but is NOT a dict. Most notably, iterating over a response
         yields parts of the body and not the headers.
+
+        :param body: The response body as one of the supported types.
+        :param status: Either an HTTP status code (e.g. 200) or a status line
+                       including the reason phrase (e.g. '200 OK').
+        :param headers: A dictionary or a list of name-value pairs.
+
+        Additional keyword arguments are added to the list of headers.
+        Underscores in the header name are replaced with dashes.
     """
 
     default_status = 200
@@ -1288,17 +1319,23 @@ class BaseResponse(object):
                   'Content-Length', 'Content-Range', 'Content-Type',
                   'Content-Md5', 'Last-Modified'))}
 
-    def __init__(self, body='', status=None, **headers):
+    def __init__(self, body='', status=None, headers=None, **more_headers):
         self._cookies = None
-        self._headers = {'Content-Type': [self.default_content_type]}
+        self._headers = {}
         self.body = body
         self.status = status or self.default_status
         if headers:
-            for name, value in headers.items():
-                self[name] = value
+            if isinstance(headers, dict):
+                headers = headers.items()
+            for name, value in headers:
+                self.add_header(name, value)
+        if more_headers:
+            for name, value in more_headers.items():
+                self.add_header(name, value)
 
     def copy(self):
         ''' Returns a copy of self. '''
+        # TODO
         copy = Response()
         copy.status = self.status
         copy._headers = dict((k, v[:]) for (k, v) in self._headers.items())
@@ -1384,7 +1421,9 @@ class BaseResponse(object):
     def headerlist(self):
         ''' WSGI conform list of (header, value) tuples. '''
         out = []
-        headers = self._headers.items()
+        headers = list(self._headers.items())
+        if 'Content-Type' not in self._headers:
+            headers.append(('Content-Type', [self.default_content_type]))
         if self._status_code in self.bad_headers:
             bad_headers = self.bad_headers[self._status_code]
             headers = [h for h in headers if h[0] not in bad_headers]
@@ -1398,11 +1437,11 @@ class BaseResponse(object):
     content_length = HeaderProperty('Content-Length', reader=int)
 
     @property
-    def charset(self):
+    def charset(self, default='UTF-8'):
         """ Return the charset specified in the content-type header (default: utf8). """
         if 'charset=' in self.content_type:
             return self.content_type.split('charset=')[-1].split(';')[0].strip()
-        return 'UTF-8'
+        return default
 
     @property
     def COOKIES(self):
@@ -1525,12 +1564,13 @@ Request = BaseRequest
 Response = BaseResponse
 
 class HTTPResponse(Response, BottleException):
-    def __init__(self, body='', status=None, header=None, **headers):
-        if header or 'output' in headers:
-            depr('Call signature changed (for the better)')
-            if header: headers.update(header)
-            if 'output' in headers: body = headers.pop('output')
-        super(HTTPResponse, self).__init__(body, status, **headers)
+    def __init__(self, body='', status=None, headers=None,
+                 header=None, **more_headers):
+        if header or 'output' in more_headers:
+            depr('Call signature changed (for the better). See BaseResponse')
+            if header: more_headers.update(header)
+            if 'output' in more_headers: body = more_headers.pop('output')
+        super(HTTPResponse, self).__init__(body, status, headers, **more_headers)
 
     def apply(self, response):
         response._status_code = self._status_code
@@ -1548,10 +1588,11 @@ class HTTPResponse(Response, BottleException):
 
 class HTTPError(HTTPResponse):
     default_status = 500
-    def __init__(self, status=None, body=None, exception=None, traceback=None, header=None, **headers):
+    def __init__(self, status=None, body=None, exception=None, traceback=None,
+                 **options):
         self.exception = exception
         self.traceback = traceback
-        super(HTTPError, self).__init__(body, status, header, **headers)
+        super(HTTPError, self).__init__(body, status, **options)
 
 
 
@@ -1574,14 +1615,22 @@ class JSONPlugin(object):
         dumps = self.json_dumps
         if not dumps: return callback
         def wrapper(*a, **ka):
-            rv = callback(*a, **ka)
+            try:
+                rv = callback(*a, **ka)
+            except HTTPError:
+                rv = _e()
+
             if isinstance(rv, dict):
                 #Attempt to serialize, raises exception on failure
                 json_response = dumps(rv)
                 #Set content type only if serialization succesful
                 response.content_type = 'application/json'
                 return json_response
+            elif isinstance(rv, HTTPResponse) and isinstance(rv.body, dict):
+                rv.body = dumps(rv.body)
+                rv.content_type = 'application/json'
             return rv
+
         return wrapper
 
 
@@ -1795,6 +1844,7 @@ class FormsDict(MultiDict):
         return copy
 
     def getunicode(self, name, default=None, encoding=None):
+        ''' Return the value as a unicode string, or the default. '''
         try:
             return self._fix(self[name], encoding)
         except (UnicodeError, KeyError):
@@ -1943,9 +1993,20 @@ class WSGIFileWrapper(object):
             yield part
 
 
-class _iterchain(itertools.chain):
+class _closeiter(object):
     ''' This only exists to be able to attach a .close method to iterators that
         do not support attribute assignment (most of itertools). '''
+
+    def __init__(self, iterator, close=None):
+        self.iterator = iterator
+        self.close_callbacks = makelist(close)
+
+    def __iter__(self):
+        return iter(self.iterator)
+
+    def close(self):
+        for func in self.close_callbacks:
+            func()
 
 
 class ResourceManager(object):
@@ -2032,6 +2093,67 @@ class ResourceManager(object):
         fname = self.lookup(name)
         if not fname: raise IOError("Resource %r not found." % name)
         return self.opener(name, mode=mode, *args, **kwargs)
+
+
+class FileUpload(object):
+
+    def __init__(self, fileobj, name, filename, headers=None):
+        ''' Wrapper for file uploads. '''
+        #: Open file(-like) object (BytesIO buffer or temporary file)
+        self.file = fileobj
+        #: Name of the upload form field
+        self.name = name
+        #: Raw filename as sent by the client (may contain unsafe characters)
+        self.raw_filename = filename
+        #: A :class:`HeaderDict` with additional headers (e.g. content-type)
+        self.headers = HeaderDict(headers) if headers else HeaderDict()
+
+    content_type = HeaderProperty('Content-Type')
+    content_length = HeaderProperty('Content-Length', reader=int, default=-1)
+
+    @cached_property
+    def filename(self):
+        ''' Name of the file on the client file system, but normalized to ensure
+            file system compatibility (lowercase, no whitespace, no path
+            separators, no unsafe characters, ASCII only). An empty filename
+            is returned as 'empty'.
+        '''
+        from unicodedata import normalize #TODO: Module level import?
+        fname = self.raw_filename
+        if isinstance(fname, unicode):
+            fname = normalize('NFKD', fname).encode('ASCII', 'ignore')
+        fname = fname.decode('ASCII', 'ignore')
+        fname = os.path.basename(fname.replace('\\', os.path.sep))
+        fname = re.sub(r'[^a-zA-Z0-9-_.\s]', '', fname).strip().lower()
+        fname = re.sub(r'[-\s]+', '-', fname.strip('.').strip())
+        return fname or 'empty'
+
+    def _copy_file(self, fp, chunk_size=2**16):
+        read, write, offset = self.file.read, fp.write, self.file.tell()
+        while 1:
+            buf = read(chunk_size)
+            if not buf: break
+            write(buf)
+        self.file.seek(offset)    
+
+    def save(self, destination, overwrite=False, chunk_size=2**16):
+        ''' Save file to disk or copy its content to an open file(-like) object.
+            If *destination* is a directory, :attr:`filename` is added to the
+            path. Existing files are not overwritten by default (IOError).
+
+            :param destination: File path, directory or file(-like) object.
+            :param overwrite: If True, replace existing files. (default: False)
+            :param chunk_size: Bytes to read at a time. (default: 64kb)
+        '''
+        if isinstance(destination, basestring): # Except file-likes here
+            if os.path.isdir(destination):
+                destination = os.path.join(destination, self.filename)
+            if not overwrite and os.path.exists(destination):
+                raise IOError('File exists.')
+            with open(destination, 'wb') as fp:
+                self._copy_file(fp, chunk_size)
+        else:
+            self._copy_file(destination, chunk_size)
 
 
 
@@ -2304,13 +2426,14 @@ def auth_basic(check, realm="private", text="Access denied"):
     ''' Callback decorator to require HTTP auth (basic).
         TODO: Add route(check_auth=...) parameter. '''
     def decorator(func):
-      def wrapper(*a, **ka):
-        user, password = request.auth or (None, None)
-        if user is None or not check(user, password):
-          headers = {'WWW-Authenticate': 'Basic realm="%s"' % realm}
-          return HTTPError(401, text, **headers)
-        return func(*a, **ka)
-      return wrapper
+        def wrapper(*a, **ka):
+            user, password = request.auth or (None, None)
+            if user is None or not check(user, password):
+                err = HTTPError(401, text)
+                err.add_header('WWW-Authenticate', 'Basic realm="%s"' % realm)
+                return err
+            return func(*a, **ka)
+        return wrapper
     return decorator
 
 
@@ -2349,8 +2472,8 @@ url       = make_default_app_wrapper('get_url')
 
 class ServerAdapter(object):
     quiet = False
-    def __init__(self, host='127.0.0.1', port=8080, **config):
-        self.options = config
+    def __init__(self, host='127.0.0.1', port=8080, **options):
+        self.options = options
         self.host = host
         self.port = int(port)
 
@@ -2409,9 +2532,8 @@ class WaitressServer(ServerAdapter):
 class PasteServer(ServerAdapter):
     def run(self, handler): # pragma: no cover
         from paste import httpserver
-        if not self.quiet:
-            from paste.translogger import TransLogger
-            handler = TransLogger(handler)
+        from paste.translogger import TransLogger
+        handler = TransLogger(handler, setup_console_handler=(not self.quiet))
         httpserver.serve(handler, host=self.host, port=str(self.port),
                          **self.options)
 
@@ -2451,7 +2573,7 @@ class TornadoServer(ServerAdapter):
         import tornado.wsgi, tornado.httpserver, tornado.ioloop
         container = tornado.wsgi.WSGIContainer(handler)
         server = tornado.httpserver.HTTPServer(container)
-        server.listen(port=self.port)
+        server.listen(port=self.port,address=self.host)
         tornado.ioloop.IOLoop.instance().start()
 
 
@@ -2495,15 +2617,17 @@ class GeventServer(ServerAdapter):
 
         * `fast` (default: False) uses libevent's http server, but has some
           issues: No streaming, no pipelining, no SSL.
+        * See gevent.wsgi.WSGIServer() documentation for more options.
     """
     def run(self, handler):
         from gevent import wsgi, pywsgi, local
         if not isinstance(_lctx, local.local):
             msg = "Bottle requires gevent.monkey.patch_all() (before import)"
             raise RuntimeError(msg)
-        if not self.options.get('fast'): wsgi = pywsgi
-        log = None if self.quiet else 'default'
-        wsgi.WSGIServer((self.host, self.port), handler, log=log).serve_forever()
+        if not self.options.pop('fast', None): wsgi = pywsgi
+        self.options['log'] = None if self.quiet else 'default'
+        address = (self.host, self.port)
+        wsgi.WSGIServer(address, handler, **self.options).serve_forever()
 
 
 class GunicornServer(ServerAdapter):
@@ -2845,8 +2969,8 @@ class BaseTemplate(object):
         """ Render the template with the specified local variables and return
         a single byte or unicode string. If it is a byte string, the encoding
         must match self.encoding. This method must be thread-safe!
-        Local variables may be provided in dictionaries (*args)
-        or directly, as keywords (**kwargs).
+        Local variables may be provided in dictionaries (args)
+        or directly, as keywords (kwargs).
         """
         raise NotImplementedError
 
