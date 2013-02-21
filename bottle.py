@@ -42,7 +42,12 @@ from datetime import date as datedate, datetime, timedelta
 from tempfile import TemporaryFile
 from traceback import format_exc, print_exc
 
-from ujson import dumps as json_dumps, loads as json_lds
+try:
+	from ujson import dumps as json_dumps, loads as json_lds
+except Exception:
+        json_dumps = None
+	json_lds = None
+
 #try: from json import dumps as json_dumps, loads as json_lds
 #except ImportError: # pragma: no cover
 #    try: from simplejson import dumps as json_dumps, loads as json_lds
