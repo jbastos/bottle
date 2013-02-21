@@ -21,7 +21,7 @@ setup(name='bottle',
       license='MIT',
       platforms = 'any',
       install_requires=[
-          "ujson >= 1.30",
+          "ujson==1.30",
       ],
       classifiers=['Development Status :: 4 - Beta',
         'Intended Audience :: Developers',
