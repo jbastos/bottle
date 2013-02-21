@@ -1,15 +1,12 @@
-Bottle Web Framework
+Ultrabottle Web Framework
 ====================
 
 .. image:: http://bottlepy.org/docs/dev/_static/logo_nav.png
   :alt: Bottle Logo
   :align: right
 
-Bottle is a fast and simple micro-framework for small web applications. It
-offers request dispatching (URL routing) with URL parameter support, templates,
-a built-in HTTP Server and adapters for many third party WSGI/HTTP-server and
-template engines - all in a single file and with no dependencies other than the
-Python Standard Library.
+Ultrabottle is a a fork of the bottle package. It uses ultrajson (ujson) as its
+backend.
 
 Homepage and documentation: http://bottlepy.org/
 License: MIT (see LICENSE)
