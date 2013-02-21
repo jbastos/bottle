@@ -10,7 +10,7 @@ if sys.version_info < (2,5):
 import bottle
 
 setup(name='ultrabottle',
-      version='0.1',
+      version='0.1.1',
       description='Bottle framework powered with ujson.',
       long_description=bottle.__doc__,
       author='Jose Bastos',
