@@ -42,16 +42,16 @@ from datetime import date as datedate, datetime, timedelta
 from tempfile import TemporaryFile
 from traceback import format_exc, print_exc
 
-try: from json import dumps as json_dumps, loads as json_lds
-except ImportError: # pragma: no cover
-    try: from simplejson import dumps as json_dumps, loads as json_lds
-    except ImportError:
-        try: from django.utils.simplejson import dumps as json_dumps, loads as json_lds
-        except ImportError:
-            def json_dumps(data):
-                raise ImportError("JSON support requires Python 2.6 or simplejson.")
-            json_lds = json_dumps
-
+from ujson import dumps as json_dumps, loads as json_lds
+#try: from json import dumps as json_dumps, loads as json_lds
+#except ImportError: # pragma: no cover
+#    try: from simplejson import dumps as json_dumps, loads as json_lds
+#    except ImportError:
+#        try: from django.utils.simplejson import dumps as json_dumps, loads as json_lds
+#        except ImportError:
+#            def json_dumps(data):
+#                raise ImportError("JSON support requires Python 2.6 or simplejson.")
+#            json_lds = json_dumps
 
 
 # We now try to fix 2.5/2.6/3.1/3.2 incompatibilities.
