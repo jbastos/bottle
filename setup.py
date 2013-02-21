@@ -9,16 +9,15 @@ if sys.version_info < (2,5):
 
 import bottle
 
-setup(name='ultrabottle',
-      version='0.1.1',
-      description='Bottle framework powered with ujson.',
+setup(name='bottle',
+      version=bottle.__version__,
+      description='Fast and simple WSGI-framework for small web-applications.',
       long_description=bottle.__doc__,
-      author='Jose Bastos',
-      author_email='ultrabottle@bastos.org',
+      author=bottle.__author__,
+      author_email='marc@gsites.de',
       url='http://bottlepy.org/',
       py_modules=['bottle'],
       scripts=['bottle.py'],
-      install_requires=['ujson >= 1.30'],
       license='MIT',
       platforms = 'any',
       classifiers=['Development Status :: 4 - Beta',
