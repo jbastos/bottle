@@ -13,10 +13,10 @@ Copyright (c) 2012, Marcel Hellkamp.
 License: MIT (see LICENSE for details)
 """
 
-#from __future__ import with_statement
+from __future__ import with_statement
 
 __author__ = 'Marcel Hellkamp'
-__version__ = '0.12'
+__version__ = '0.12-dev'
 __license__ = 'MIT'
 
 # The gevent server adapter needs to patch some modules before they are imported
@@ -42,21 +42,19 @@ from datetime import date as datedate, datetime, timedelta
 from tempfile import TemporaryFile
 from traceback import format_exc, print_exc
 
-try:
-	from ujson import dumps as json_dumps, loads as json_lds
-except Exception:
-        json_dumps = None
-	json_lds = None
 
-#try: from json import dumps as json_dumps, loads as json_lds
-#except ImportError: # pragma: no cover
-#    try: from simplejson import dumps as json_dumps, loads as json_lds
-#    except ImportError:
-#        try: from django.utils.simplejson import dumps as json_dumps, loads as json_lds
-#        except ImportError:
-#            def json_dumps(data):
-#                raise ImportError("JSON support requires Python 2.6 or simplejson.")
-#            json_lds = json_dumps
+try: from ujson import dumps as json_dumps, loads as json_lds
+except ImportError: # pragma: no cover
+    try: from json import dumps as json_dumps, loads as json_lds
+    except ImportError: # pragma: no cover
+        try: from simplejson import dumps as json_dumps, loads as json_lds
+        except ImportError:
+            try: from django.utils.simplejson import dumps as json_dumps, loads as json_lds
+            except ImportError:
+                def json_dumps(data):
+                    raise ImportError("JSON support requires Python 2.6 or simplejson.")
+                json_lds = json_dumps
+
 
 
 # We now try to fix 2.5/2.6/3.1/3.2 incompatibilities.
