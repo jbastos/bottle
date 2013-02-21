@@ -2,7 +2,7 @@
 
 import sys
 import os
-from setuptools import setup
+from setuptools import setup,find_packages
 
 if sys.version_info < (2,5):
     raise NotImplementedError("Sorry, you need at least Python 2.5 or Python 3.x to use bottle.")
@@ -16,6 +16,7 @@ setup(name='bottle',
       author=bottle.__author__,
       author_email='marc@gsites.de',
       url='http://bottlepy.org/',
+      packages=find_packages(),
       py_modules=['bottle'],
       scripts=['bottle.py'],
       license='MIT',
