@@ -36,7 +36,7 @@ if __name__ == '__main__':
         import gevent.monkey; gevent.monkey.patch_all()
 
 import base64, cgi, email.utils, functools, hmac, imp, itertools, mimetypes,\
-        os, re, subprocess, sys, tempfile, threading, time, urllib, warnings
+        os, re, subprocess, sys, tempfile, threading, time, warnings
 
 from datetime import date as datedate, datetime, timedelta
 from tempfile import TemporaryFile
@@ -61,9 +61,9 @@ except ImportError: # pragma: no cover
 # It ain't pretty but it works... Sorry for the mess.
 
 py   = sys.version_info
-py3k = py >= (3,0,0)
-py25 = py <  (2,6,0)
-py31 = (3,1,0) <= py < (3,2,0)
+py3k = py >= (3, 0, 0)
+py25 = py <  (2, 6, 0)
+py31 = (3, 1, 0) <= py < (3, 2, 0)
 
 # Workaround for the missing "as" keyword in py3k.
 def _e(): return sys.exc_info()[1]
@@ -138,7 +138,7 @@ def update_wrapper(wrapper, wrapped, *a, **ka):
 # These helpers are used at module level and need to be defined first.
 # And yes, I know PEP-8, but sometimes a lower-case classname makes more sense.
 
-def depr(message):
+def depr(message, hard=False):
     warnings.warn(message, DeprecationWarning, stacklevel=3)
 
 def makelist(data): # This is just to handy
@@ -241,6 +241,14 @@ class RouteBuildError(RouteError):
     """ The route could not been built """
 
 
+def _re_flatten(p):
+    ''' Turn all capturing groups in a regular expression pattern into
+        non-capturing groups. '''
+    if '(' not in p: return p
+    return re.sub(r'(\\*)(\(\?P<[^>]*>|\((?!\?))',
+        lambda m: m.group(0) if len(m.group(1)) % 2 else m.group(1) + '(?:', p)
+
+
 class Router(object):
     ''' A Router is an ordered collection of route->target pairs. It is used to
         efficiently match WSGI requests against a number of routes and return
@@ -254,34 +262,22 @@ class Router(object):
     '''
 
     default_pattern = '[^/]+'
-    default_filter   = 're'
-    #: Sorry for the mess. It works. Trust me.
-    rule_syntax = re.compile('(\\\\*)'\
-        '(?:(?::([a-zA-Z_][a-zA-Z_0-9]*)?()(?:#(.*?)#)?)'\
-          '|(?:<([a-zA-Z_][a-zA-Z_0-9]*)?(?::([a-zA-Z_]*)'\
-            '(?::((?:\\\\.|[^\\\\>]+)+)?)?)?>))')
+    default_filter  = 're'
 
     def __init__(self, strict=False):
-        self.rules    = {} # A {rule: Rule} mapping
-        self.builder  = {} # A rule/name->build_info mapping
-        self.static   = {} # Cache for static routes: {path: {method: target}}
-        self.dynamic  = [] # Cache for dynamic routes. See _compile()
+        self.rules    = [] # All rules in order
+        self._groups  = {}
+        self.builder  = {} # Data structure for the url builder
+        self.static   = {} # Search structure for static routes
+        self.dynamic  = [] # Search structure for dynamic routes
         #: If true, static routes are no longer checked first.
         self.strict_order = strict
-        self.filters = {'re': self.re_filter, 'int': self.int_filter,
-                        'float': self.float_filter, 'path': self.path_filter}
-
-    def re_filter(self, conf):
-        return conf or self.default_pattern, None, None
-
-    def int_filter(self, conf):
-        return r'-?\d+', int, lambda x: str(int(x))
-
-    def float_filter(self, conf):
-        return r'-?[\d.]+', float, lambda x: str(float(x))
-
-    def path_filter(self, conf):
-        return r'.+?', None, None
+        self.filters = {
+            're':    lambda conf:
+                (_re_flatten(conf or self.default_pattern), None, None),
+            'int':   lambda conf: (r'-?\d+', int, lambda x: str(int(x))),
+            'float': lambda conf: (r'-?[\d.]+', float, lambda x: str(float(x))),
+            'path':  lambda conf: (r'.+?', None, None)}
 
     def add_filter(self, name, func):
         ''' Add a filter. The provided function is called with the configuration
@@ -289,9 +285,12 @@ class Router(object):
         The first element is a string, the last two are callables or None. '''
         self.filters[name] = func
 
-    def parse_rule(self, rule):
-        ''' Parses a rule into a (name, filter, conf) token stream. If mode is
-            None, name contains a static rule part. '''
+    rule_syntax = re.compile('(\\\\*)'\
+        '(?:(?::([a-zA-Z_][a-zA-Z_0-9]*)?()(?:#(.*?)#)?)'\
+          '|(?:<([a-zA-Z_][a-zA-Z_0-9]*)?(?::([a-zA-Z_]*)'\
+            '(?::((?:\\\\.|[^\\\\>]+)+)?)?)?>))')
+
+    def _itertokens(self, rule):
         offset, prefix = 0, ''
         for match in self.rule_syntax.finditer(rule):
             prefix += rule[offset:match.start()]
@@ -300,77 +299,89 @@ class Router(object):
                 prefix += match.group(0)[len(g[0]):]
                 offset = match.end()
                 continue
-            if prefix: yield prefix, None, None
-            name, filtr, conf = g[1:4] if not g[2] is None else g[4:7]
-            if not filtr: filtr = self.default_filter
-            yield name, filtr, conf or None
+            if prefix:
+                yield prefix, None, None
+            name, filtr, conf = g[4:7] if g[2] is None else g[1:4]
+            yield name, filtr or 'default', conf or None
             offset, prefix = match.end(), ''
         if offset <= len(rule) or prefix:
             yield prefix+rule[offset:], None, None
 
     def add(self, rule, method, target, name=None):
-        ''' Add a new route or replace the target for an existing route. '''
-        if rule in self.rules:
-            self.rules[rule][method] = target
-            if name: self.builder[name] = self.builder[rule]
-            return
-
-        target = self.rules[rule] = {method: target}
-
-        # Build pattern and other structures for dynamic routes
-        anons = 0      # Number of anonymous wildcards
-        pattern = ''   # Regular expression  pattern
-        filters = []   # Lists of wildcard input filters
-        builder = []   # Data structure for the URL builder
+        ''' Add a new rule or replace the target for an existing rule. '''
+        anons     = 0    # Number of anonymous wildcards found
+        keys      = []   # Names of keys
+        pattern   = ''   # Regular expression pattern with named groups
+        filters   = []   # Lists of wildcard input filters
+        builder   = []   # Data structure for the URL builder
         is_static = True
-        for key, mode, conf in self.parse_rule(rule):
+
+        for key, mode, conf in self._itertokens(rule):
             if mode:
                 is_static = False
+                if mode == 'default': mode = self.default_filter
                 mask, in_filter, out_filter = self.filters[mode](conf)
-                if key:
-                    pattern += '(?P<%s>%s)' % (key, mask)
-                else:
+                if not key:
                     pattern += '(?:%s)' % mask
-                    key = 'anon%d' % anons; anons += 1
+                    key = 'anon%d' % anons
+                    anons += 1
+                else:
+                    pattern += '(?P<%s>%s)' % (key, mask)
+                    keys.append(key)
                 if in_filter: filters.append((key, in_filter))
                 builder.append((key, out_filter or str))
             elif key:
                 pattern += re.escape(key)
                 builder.append((None, key))
+
         self.builder[rule] = builder
         if name: self.builder[name] = builder
 
         if is_static and not self.strict_order:
-            self.static[self.build(rule)] = target
+            group = self.static.setdefault(self.build(rule), {})
+            group[method] = (target, None)
             return
 
-        def fpat_sub(m):
-            return m.group(0) if len(m.group(1)) % 2 else m.group(1) + '(?:'
-        flat_pattern = re.sub(r'(\\*)(\(\?P<[^>]*>|\((?!\?))', fpat_sub, pattern)
-
         try:
-            re_match = re.compile('^(%s)$' % pattern).match
+            re_pattern = re.compile('^(%s)$' % pattern)
+            re_match = re_pattern.match
         except re.error:
             raise RouteSyntaxError("Could not add Route: %s (%s)" % (rule, _e()))
 
-        def match(path):
-            """ Return an url-argument dictionary. """
-            url_args = re_match(path).groupdict()
-            for name, wildcard_filter in filters:
-                try:
-                    url_args[name] = wildcard_filter(url_args[name])
-                except ValueError:
-                    raise HTTPError(400, 'Path has wrong format.')
-            return url_args
+        if filters:
+            def getargs(path):
+                url_args = re_match(path).groupdict()
+                for name, wildcard_filter in filters:
+                    try:
+                        url_args[name] = wildcard_filter(url_args[name])
+                    except ValueError:
+                        raise HTTPError(400, 'Path has wrong format.')
+                return url_args
+        elif re_pattern.groupindex:
+            def getargs(path):
+                return re_match(path).groupdict()
+        else:
+            getargs = None
 
+        flatpat = _re_flatten(pattern)
+        if flatpat in self._groups:
+            # Info: Rule groups with previous rule
+            group = self._groups[flatpat]
+            if method in group:
+                if DEBUG:
+                    msg = 'Route <%s %s> overwrites a previously defined route'
+                    warnings.warn(msg % (method, rule), RuntimeWarning)
+            self._groups[flatpat][method] = (target, getargs)
+            return
+
+        mdict = self._groups[flatpat] = {method: (target, getargs)}
+        
         try:
-            combined = '%s|(^%s$)' % (self.dynamic[-1][0].pattern, flat_pattern)
+            combined = '%s|(^%s$)' % (self.dynamic[-1][0].pattern, flatpat)
             self.dynamic[-1] = (re.compile(combined), self.dynamic[-1][1])
-            self.dynamic[-1][1].append((match, target))
+            self.dynamic[-1][1].append(mdict)
         except (AssertionError, IndexError): # AssertionError: Too many groups
-            self.dynamic.append((re.compile('(^%s$)' % flat_pattern),
-                                [(match, target)]))
-        return match
+            self.dynamic.append((re.compile('(^%s$)' % flatpat), [mdict]))
 
     def build(self, _name, *anons, **query):
         ''' Build an URL by filling the wildcards in a rule. '''
@@ -392,23 +403,29 @@ class Router(object):
             for combined, rules in self.dynamic:
                 match = combined.match(path)
                 if not match: continue
-                getargs, targets = rules[match.lastindex - 1]
-                urlargs = getargs(path) if getargs else {}
+                targets = rules[match.lastindex - 1]
                 break
 
         if not targets:
             raise HTTPError(404, "Not found: " + repr(environ['PATH_INFO']))
         method = environ['REQUEST_METHOD'].upper()
         if method in targets:
-            return targets[method], urlargs
-        if method == 'HEAD' and 'GET' in targets:
-            return targets['GET'], urlargs
-        if 'ANY' in targets:
-            return targets['ANY'], urlargs
-        allowed = [verb for verb in targets if verb != 'ANY']
-        if 'GET' in allowed and 'HEAD' not in allowed:
-            allowed.append('HEAD')
-        raise HTTPError(405, "Method not allowed.", Allow=",".join(allowed))
+            target, getargs = targets[method]
+        elif method == 'HEAD' and 'GET' in targets:
+            target, getargs = targets['GET']
+        elif 'ANY' in targets:
+            target, getargs = targets['ANY']            
+        else:
+            allowed = [verb for verb in targets if verb != 'ANY']
+            if 'GET' in allowed and 'HEAD' not in allowed:
+                allowed.append('HEAD')
+            raise HTTPError(405, "Method not allowed.", Allow=",".join(allowed))
+        
+        return target, getargs(path) if getargs else {}
+
+
+
+
 
 
 class Route(object):
@@ -552,8 +569,7 @@ class Bottle(object):
             All other parameters are passed to the underlying :meth:`route` call.
         '''
         if isinstance(app, basestring):
-            prefix, app = app, prefix
-            depr('Parameter order of Bottle.mount() changed.') # 0.10
+            depr('Parameter order of Bottle.mount() changed.', True) # 0.10
 
         segments = [p for p in prefix.split('/') if p]
         if not segments: raise ValueError('Empty path prefix.')
@@ -1694,9 +1710,6 @@ class TemplatePlugin(object):
         conf = route.config.get('template')
         if isinstance(conf, (tuple, list)) and len(conf) == 2:
             return view(conf[0], **conf[1])(callback)
-        elif isinstance(conf, str) and 'template_opts' in route.config:
-            depr('The `template_opts` parameter is deprecated.') #0.9
-            return view(conf, **route.config['template_opts'])(callback)
         elif isinstance(conf, str):
             return view(conf)(callback)
         else:
@@ -2261,6 +2274,7 @@ def debug(mode=True):
     """ Change the debug level.
     There is only one debug level supported at the moment."""
     global DEBUG
+    if mode: warnings.simplefilter('default')
     DEBUG = bool(mode)
 
 
@@ -2402,27 +2416,6 @@ def path_shift(script_name, path_info, shift=1):
     new_path_info = '/' + '/'.join(pathlist)
     if path_info.endswith('/') and pathlist: new_path_info += '/'
     return new_script_name, new_path_info
-
-
-def validate(**vkargs):
-    """
-    Validates and manipulates keyword arguments by user defined callables.
-    Handles ValueError and missing arguments by raising HTTPError(403).
-    """
-    depr('Use route wildcard filters instead.')
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kargs):
-            for key, value in vkargs.items():
-                if key not in kargs:
-                    abort(403, 'Missing parameter: %s' % key)
-                try:
-                    kargs[key] = value(kargs[key])
-                except ValueError:
-                    abort(403, 'Wrong parameter format for: %s' % key)
-            return func(*args, **kargs)
-        return wrapper
-    return decorator
 
 
 def auth_basic(check, realm="private", text="Access denied"):
@@ -3044,31 +3037,6 @@ class Jinja2Template(BaseTemplate):
             return f.read().decode(self.encoding)
 
 
-class SimpleTALTemplate(BaseTemplate):
-    ''' Deprecated, do not use. '''
-    def prepare(self, **options):
-        depr('The SimpleTAL template handler is deprecated'\
-             ' and will be removed in 0.12')
-        from simpletal import simpleTAL
-        if self.source:
-            self.tpl = simpleTAL.compileHTMLTemplate(self.source)
-        else:
-            with open(self.filename, 'rb') as fp:
-                self.tpl = simpleTAL.compileHTMLTemplate(tonat(fp.read()))
-
-    def render(self, *args, **kwargs):
-        from simpletal import simpleTALES
-        for dictarg in args: kwargs.update(dictarg)
-        context = simpleTALES.Context()
-        for k,v in self.defaults.items():
-            context.addGlobal(k, v)
-        for k,v in kwargs.items():
-            context.addGlobal(k, v)
-        output = StringIO()
-        self.tpl.expand(context, output)
-        return output.getvalue()
-
-
 class SimpleTemplate(BaseTemplate):
     blocks = ('if', 'elif', 'else', 'try', 'except', 'finally', 'for', 'while',
               'with', 'def', 'class')
@@ -3114,7 +3082,10 @@ class SimpleTemplate(BaseTemplate):
         ptrbuffer = [] # Buffer for printable strings and token tuple instances
         codebuffer = [] # Buffer for generated python code
         multiline = dedent = oneline = False
-        template = self.source or open(self.filename, 'rb').read()
+        template = self.source
+        if not template:
+            with open(self.filename, 'rb') as fp:
+                template = fp.read()
 
         def yield_tokens(line):
             for i, part in enumerate(re.split(r'\{\{(.*?)\}\}', line)):
@@ -3250,7 +3221,6 @@ def template(*args, **kwargs):
 mako_template = functools.partial(template, template_adapter=MakoTemplate)
 cheetah_template = functools.partial(template, template_adapter=CheetahTemplate)
 jinja2_template = functools.partial(template, template_adapter=Jinja2Template)
-simpletal_template = functools.partial(template, template_adapter=SimpleTALTemplate)
 
 
 def view(tpl_name, **defaults):
@@ -3280,7 +3250,6 @@ def view(tpl_name, **defaults):
 mako_view = functools.partial(view, template_adapter=MakoTemplate)
 cheetah_view = functools.partial(view, template_adapter=CheetahTemplate)
 jinja2_view = functools.partial(view, template_adapter=Jinja2Template)
-simpletal_view = functools.partial(view, template_adapter=SimpleTALTemplate)
 
 
 
